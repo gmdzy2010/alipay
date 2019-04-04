@@ -7,9 +7,9 @@
 """
 import json
 from datetime import datetime
-from Crypto.Signature import PKCS1_v1_5
-from Crypto.Hash import SHA, SHA256
-from Crypto.PublicKey import RSA
+from Cryptodome.Signature import PKCS1_v1_5
+from Cryptodome.Hash import SHA, SHA256
+from Cryptodome.PublicKey import RSA
 
 from .compat import quote_plus, urlopen, decodebytes, encodebytes, b
 from .exceptions import AliPayException, AliPayValidationError
@@ -29,16 +29,6 @@ class BaseAliPay(object):
         """
         签名用
         """
-        if not self._app_private_key:
-
-            if self._app_private_key_path:
-                with open(self._app_private_key_path) as fp:
-                    self._app_private_key = RSA.importKey(fp.read())
-            elif self._app_private_key_string:
-                self._app_private_key = RSA.importKey(self._app_private_key_string)
-            else:
-                raise Exception("App private key is not specified")
-
         return self._app_private_key
 
     @property
@@ -46,15 +36,6 @@ class BaseAliPay(object):
         """
         验证签名用
         """
-        if not self._alipay_public_key:
-            if self._alipay_public_key_path:
-                with open(self._alipay_public_key_path) as fp:
-                    self._alipay_public_key = RSA.importKey(fp.read())
-            elif self._alipay_public_key_string:
-                self._alipay_public_key = RSA.importKey(self._alipay_public_key_string)
-            else:
-                raise Exception("Alipay public key is not specified")
-
         return self._alipay_public_key
 
     def __init__(
@@ -66,12 +47,13 @@ class BaseAliPay(object):
         alipay_public_key_path=None,
         alipay_public_key_string=None,
         sign_type="RSA2",
-        debug=False):
+        debug=False
+    ):
         """
         初始化:
         alipay = AliPay(
           appid="",
-          app_notify_url="",
+          app_notify_url="http://example.com",
           app_private_key_path="",
           alipay_public_key_path="",
           sign_type="RSA2"
@@ -94,6 +76,24 @@ class BaseAliPay(object):
             self._gateway = "https://openapi.alipaydev.com/gateway.do"
         else:
             self._gateway = "https://openapi.alipay.com/gateway.do"
+
+        # load key file immediately
+        self._load_key()
+
+    def _load_key(self):
+        # load private key
+        content = self._app_private_key_string
+        if not content:
+            with open(self._app_private_key_path) as fp:
+                content = fp.read()
+        self._app_private_key = RSA.importKey(content)
+
+        # load public key
+        content = self._alipay_public_key_string
+        if not content:
+            with open(self._alipay_public_key_path) as fp:
+                content = fp.read()
+        self._alipay_public_key = RSA.importKey(content)
 
     def _sign(self, unsigned_string):
         """
@@ -125,10 +125,7 @@ class BaseAliPay(object):
         return sign
 
     def _ordered_data(self, data):
-        complex_keys = []
-        for key, value in data.items():
-            if isinstance(value, dict):
-                complex_keys.append(key)
+        complex_keys = [k for k, v in data.items() if isinstance(v, dict)]
 
         # 将字典类型的数据dump出来
         for key in complex_keys:
@@ -157,22 +154,17 @@ class BaseAliPay(object):
         if method in (
             "alipay.trade.app.pay", "alipay.trade.wap.pay", "alipay.trade.page.pay",
             "alipay.trade.pay", "alipay.trade.precreate"
-        ):
-            if self._app_notify_url is not None:
-                data["notify_url"] = self._app_notify_url
-
-            if notify_url is not None:
-                data["notify_url"] = notify_url
+        ) and (notify_url or self._app_notify_url):
+            data["notify_url"] = notify_url or self._app_notify_url
 
         return data
 
     def sign_data(self, data):
         data.pop("sign", None)
         # 排序后的字符串
-        unsigned_items = self._ordered_data(data)
-        unsigned_string = "&".join("{}={}".format(k, v) for k, v in unsigned_items)
-        sign = self._sign(unsigned_string)
         ordered_items = self._ordered_data(data)
+        unsigned_string = "&".join("{}={}".format(k, v) for k, v in ordered_items)
+        sign = self._sign(unsigned_string)
         quoted_string = "&".join("{}={}".format(k, quote_plus(v)) for k, v in ordered_items)
 
         # 获得最终的订单信息字符串
@@ -415,6 +407,35 @@ class BaseAliPay(object):
         raw_string = urlopen(url, timeout=15).read().decode("utf-8")
         return self._verify_and_return_sync_response(raw_string, "alipay_trade_cancel_response")
 
+    def api_alipay_trade_close(self, out_trade_no=None, trade_no=None, operator_id=None):
+        """
+        response = {
+            "alipay_trade_close_response": {
+                "code": "10000",
+                "msg": "Success",
+                "trade_no": "2013112111001004500000675971",
+                "out_trade_no": "YX_001"a
+            }
+        }
+        """
+
+        assert (out_trade_no is not None) or (trade_no is not None),\
+            "Both trade_no and out_trade_no are None"
+
+        biz_content = {}
+        if out_trade_no:
+            biz_content["out_trade_no"] = out_trade_no
+        if trade_no:
+            biz_content["trade_no"] = trade_no
+        if operator_id:
+            biz_content["operator_id"] = operator_id
+
+        data = self.build_body("alipay.trade.close", biz_content)
+
+        url = self._gateway + "?" + self.sign_data(data)
+        raw_string = urlopen(url, timeout=15).read().decode("utf-8")
+        return self._verify_and_return_sync_response(raw_string, "alipay_trade_close_response")
+
     def api_alipay_trade_precreate(self, subject, out_trade_no, total_amount, **kwargs):
         """
         success response  = {
@@ -507,60 +528,82 @@ class BaseAliPay(object):
             raw_string, "alipay_fund_trans_order_query_response"
         )
 
+    def api_alipay_trade_order_settle(
+        self,
+        out_request_no,
+        trade_no,
+        royalty_parameters,
+        **kwargs
+    ):
+        biz_content = {
+            "out_request_no": out_request_no,
+            "trade_no": trade_no,
+            "royalty_parameters": royalty_parameters,
+        }
+        biz_content.update(kwargs)
+
+        data = self.build_body("alipay.trade.order.settle", biz_content)
+
+        url = self._gateway + "?" + self.sign_data(data)
+        raw_string = urlopen(url, timeout=15).read().decode("utf-8")
+        return self._verify_and_return_sync_response(
+            raw_string, "alipay_trade_order_settle_response"
+        )
+
     def _verify_and_return_sync_response(self, raw_string, response_type):
         """
-        return data if verification succeeded, else raise exception
+        return data if verification succeeded, raise exception if not
+
+        As to ssue #69, json.loads(raw_string)[response_type] should not be return directly,
+        use json.loads(plain_content) instead
+
+        failed response is like
+        {
+          "alipay_trade_query_response": {
+            "sub_code": "isv.invalid-app-id",
+            "code": "40002",
+            "sub_msg": "无效的AppID参数",
+            "msg": "Invalid Arguments"
+          }
+        }
         """
 
         response = json.loads(raw_string)
-        result = response[response_type]
+        # raise exceptions
+        if "sign" not in response.keys():
+            result = response[response_type]
+            raise AliPayException(
+                code=result.get("code", "0"),
+                message=response
+            )
+
         sign = response["sign"]
 
         # locate string to be signed
-        raw_string = self._get_string_to_be_signed(
-            raw_string, response_type
-        )
+        plain_content = self._get_string_to_be_signed(raw_string, response_type)
 
-        if not self._verify(raw_string, sign):
+        if not self._verify(plain_content, sign):
             raise AliPayValidationError
-        return result
+        return json.loads(plain_content)
 
     def _get_string_to_be_signed(self, raw_string, response_type):
         """
-        https://doc.open.alipay.com/docs/doc.htm?docType=1&articleId=106120
+        https://docs.open.alipay.com/200/106120
         从同步返回的接口里面找到待签名的字符串
         """
-        left_index = 0
-        right_index = 0
-
-        index = raw_string.find(response_type)
-        left_index = raw_string.find("{", index)
-        index = left_index + 1
-
-        balance = -1
-        while balance < 0 and index < len(raw_string) - 1:
-            index_a = raw_string.find("{", index)
-            index_b = raw_string.find("}", index)
-
-            # 右括号没找到， 退出
-            if index_b == -1:
-                break
-            right_index = index_b
-
-            # 左括号没找到，移动到右括号的位置
-            if index_a == -1:
-                index = index_b + 1
+        balance = 0
+        start = end = raw_string.find("{", raw_string.find(response_type))
+        # 从response_type之后的第一个｛的下一位开始匹配，
+        # 如果是｛则balance加1; 如果是｝而且balance=0，就是待验签字符串的终点
+        for i, c in enumerate(raw_string[start + 1:], start + 1):
+            if c == "{":
                 balance += 1
-            # 左括号出现在有括号之前，移动到左括号的位置
-            elif index_a > index_b:
-                balance += 1
-                index = index_b + 1
-            # 左括号出现在右括号之后， 移动到右括号的位置
-            else:
+            elif c == "}":
+                if balance == 0:
+                    end = i + 1
+                    break
                 balance -= 1
-                index = index_a + 1
-
-        return raw_string[left_index: right_index + 1]
+        return raw_string[start:end]
 
 
 class AliPay(BaseAliPay):
@@ -569,17 +612,33 @@ class AliPay(BaseAliPay):
 
 class ISVAliPay(BaseAliPay):
 
-    def __init__(self, appid, app_notify_url, app_private_key_path,
-                 alipay_public_key_path, sign_type="RSA2", debug=False,
-                 app_auth_token=None, app_auth_code=None):
+    def __init__(
+        self,
+        appid,
+        app_notify_url,
+        app_private_key_path=None,
+        app_private_key_string=None,
+        alipay_public_key_path=None,
+        alipay_public_key_string=None,
+        sign_type="RSA2",
+        debug=False,
+        app_auth_token=None,
+        app_auth_code=None
+    ):
         if not app_auth_token and not app_auth_code:
             raise Exception("Both app_auth_code and app_auth_token are None !!!")
 
         self._app_auth_token = app_auth_token
         self._app_auth_code = app_auth_code
         super(ISVAliPay, self).__init__(
-            appid, app_notify_url, app_private_key_path,
-            alipay_public_key_path, sign_type, debug
+            appid,
+            app_notify_url,
+            app_private_key_path=app_private_key_path,
+            app_private_key_string=app_private_key_string,
+            alipay_public_key_path=alipay_public_key_path,
+            alipay_public_key_string=alipay_public_key_string,
+            sign_type=sign_type,
+            debug=debug
         )
 
     @property

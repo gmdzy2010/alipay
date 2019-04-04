@@ -9,8 +9,8 @@ import unittest
 import json
 import subprocess
 
-from alipay import AliPay
-from alipay.exceptions import AliPayValidationError
+from alipay import AliPay, ISVAliPay
+from alipay.exceptions import AliPayValidationError, AliPayException
 from tests import helper
 from tests.compat import mock
 
@@ -46,6 +46,16 @@ class AliPayTestCase(unittest.TestCase):
         }
         return json.dumps(response).encode("utf-8")
 
+    def _prepare_failed_trade_query_responsy(self, alipay):
+        return json.dumps({
+            "alipay_trade_query_response": {
+                "sub_code": "isv.invalid-app-id",
+                "code": "40002",
+                "sub_msg": "无效的AppID参数",
+                "msg": "Invalid Arguments"
+            }
+        }).encode("utf8")
+
     def _prepare_precreate_face_to_face_response(self, alipay):
         return self._prepare_sync_response(alipay, "alipay_trade_precreate_response")
 
@@ -66,6 +76,9 @@ class AliPayTestCase(unittest.TestCase):
 
     def _prepare_alipay_fund_trans_order_query(self, alipay):
         return self._prepare_sync_response(alipay, "alipay_fund_trans_order_query_response")
+
+    def _prepare_alipay_trade_order_settle(self, alipay):
+        return self._prepare_sync_response(alipay, "alipay_trade_order_settle_response")
 
     def get_client(self, sign_type):
         return AliPay(
@@ -101,7 +114,7 @@ class AliPayTestCase(unittest.TestCase):
         alipay = self.get_client("RSA")
         result1 = alipay._sign("hello\n")
         result2 = subprocess.check_output(
-            "echo hello | openssl sha -sha1 -sign {} | openssl base64".format(
+            "echo hello | openssl dgst -sha1 -sign {} | openssl base64".format(
                 self._app_private_key_path
             ), shell=True).decode("utf-8")
         result2 = result2.replace("\n", "")
@@ -113,7 +126,7 @@ class AliPayTestCase(unittest.TestCase):
         alipay = self.get_client("RSA2")
         result1 = alipay._sign("hello\n")
         result2 = subprocess.check_output(
-            "echo hello | openssl sha -sha256 -sign {} | openssl base64".format(
+            "echo hello | openssl dgst -sha256 -sign {} | openssl base64".format(
                 self._app_private_key_path
             ), shell=True).decode("utf-8")
         result2 = result2.replace("\n", "")
@@ -154,6 +167,19 @@ class AliPayTestCase(unittest.TestCase):
             "subject"
         )
 
+        self.assertTrue(mock_urlopen.called)
+
+    @mock.patch("alipay.urlopen")
+    def test_handle_alipay_exception(self, mock_urlopen):
+        alipay = self.get_client("RSA2")
+        response = mock.Mock()
+        response.read.return_value = self._prepare_failed_trade_query_responsy(alipay)
+        mock_urlopen.return_value = response
+
+        with self.assertRaises(AliPayException):
+            alipay.api_alipay_trade_query(
+                out_trade_no="out_trade_no",
+            )
         self.assertTrue(mock_urlopen.called)
 
     @mock.patch("alipay.urlopen")
@@ -211,7 +237,8 @@ class AliPayTestCase(unittest.TestCase):
     def test_alipay_fund_trans_toaccount_transfer(self, mock_urlopen):
         alipay = self.get_client("RSA2")
         response = mock.Mock()
-        response.read.return_value = self._prepare_alipay_fund_trans_toaccount_transfer_respone(alipay)
+        response.read.return_value = \
+            self._prepare_alipay_fund_trans_toaccount_transfer_respone(alipay)
         mock_urlopen.return_value = response
 
         alipay.api_alipay_fund_trans_toaccount_transfer(
@@ -232,6 +259,19 @@ class AliPayTestCase(unittest.TestCase):
 
         alipay.api_alipay_fund_trans_order_query(
             "out_biz_no",
+        )
+
+        self.assertTrue(mock_urlopen.called)
+
+    @mock.patch("alipay.urlopen")
+    def test_alipay_trade_order_settle(self, mock_urlopen):
+        alipay = self.get_client("RSA2")
+        response = mock.Mock()
+        response.read.return_value = self._prepare_alipay_trade_order_settle(alipay)
+        mock_urlopen.return_value = response
+
+        alipay.api_alipay_trade_order_settle(
+            "out_biz_no", "trade_no", [{"parameters": "paramters"}]
         )
 
         self.assertTrue(mock_urlopen.called)
@@ -295,6 +335,61 @@ class AliPayTestCase(unittest.TestCase):
         }
         alipay = self.get_client(sign_type="RSA2")
         alipay.verify(data, "ssss")
+
+    def test_isv_alipay(self):
+        """
+        不报错就行
+        """
+        return ISVAliPay(
+            appid="appid",
+            app_notify_url="http://example.com/app_notify_url",
+            app_private_key_path=self._app_private_key_path,
+            alipay_public_key_path=self._app_public_key_path,
+            app_auth_code="test"
+        )
+
+    def test_init_alipay_with_string(self):
+        with open(self._app_private_key_path) as fp:
+            private_string = fp.read()
+        with open(self._app_public_key_path) as fp:
+            public_string = fp.read()
+
+        return AliPay(
+            appid="appid",
+            app_notify_url="http://example.com/app_notify_url",
+            app_private_key_string=private_string,
+            alipay_public_key_string=public_string,
+        )
+
+    def test_init_alipay_with_file(self):
+        return AliPay(
+            appid="appid",
+            app_notify_url="http://example.com/app_notify_url",
+            app_private_key_path=self._app_private_key_path,
+            alipay_public_key_path=self._app_public_key_path,
+        )
+
+    def test_verify_and_return_sync_response(self):
+        """
+        test for issue#69
+        """
+        alipay = self.get_client("RSA2")
+        response_data = {
+            "should_be_true": True
+        }
+
+        sign = alipay._sign(json.dumps(response_data))
+        raw_string = """
+        {
+            "response": {"should_be_true": true},
+            "response": {"should_be_true": false},
+            "sign": "sign_data"
+        }
+        """
+
+        raw_string = raw_string.replace("sign_data", sign)
+        result = alipay._verify_and_return_sync_response(raw_string, "response")
+        self.assertTrue(result["should_be_true"])
 
     def test_get_string_to_be_signed(self):
         alipay = self.get_client("RSA2")
